@@ -53,29 +53,24 @@ function price(value: number | string | undefined): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-function splitThinkingId(id: string): { base: string; level: keyof NonNullable<ProviderModelConfig["thinkingLevelMap"]>; suffix: string } | undefined {
-  const match = id.match(/^(.*):thinking(?::(low|medium|max|xhigh))?$/i);
-  if (!match) return undefined;
-
-  const suffix = match[2]?.toLowerCase();
-  return {
-    base: match[1],
-    level: suffix === "low" || suffix === "medium" ? suffix : suffix === "max" || suffix === "xhigh" ? "xhigh" : "high",
-    suffix: suffix ? `:thinking:${suffix}` : ":thinking",
-  };
-}
-
-function toPiModel(
-  model: NanoModel,
-  thinkingMap?: ProviderModelConfig["thinkingLevelMap"],
-  forceReasoning?: boolean,
-): ProviderModelConfig {
-  const reasoning = forceReasoning ?? Boolean(thinkingMap || model.capabilities?.reasoning);
+function toPiModel(model: NanoModel): ProviderModelConfig {
+  const reasoning = Boolean(model.capabilities?.reasoning);
   return {
     id: model.id,
     name: model.name ?? model.id,
     reasoning,
-    ...(thinkingMap ? { thinkingLevelMap: thinkingMap } : {}),
+    ...(reasoning ? {
+      // NanoGPT accepts reasoning_effort with values: none, minimal, low, medium, high, xhigh.
+      // Map Pi thinking levels 1:1 to NanoGPT values.
+      thinkingLevelMap: {
+        off: "none",
+        minimal: "minimal",
+        low: "low",
+        medium: "medium",
+        high: "high",
+        xhigh: "xhigh",
+      },
+    } : {}),
     input: model.capabilities?.vision ? ["text", "image"] : ["text"],
     cost: {
       input: price(model.pricing?.prompt),
@@ -88,7 +83,7 @@ function toPiModel(
     compat: {
       supportsStore: false,
       supportsDeveloperRole: false,
-      supportsReasoningEffort: Boolean(thinkingMap),
+      supportsReasoningEffort: reasoning,
       maxTokensField: "max_tokens",
     },
   };
@@ -104,38 +99,22 @@ async function fetchNanoModels(apiKey?: string): Promise<ProviderModelConfig[]> 
   const body = (await res.json()) as { data?: NanoModel[] };
   const models = (body.data ?? []).filter((m) => m.id);
 
-  // Collect which base IDs have :thinking variants
+  // Collect base IDs that have :thinking variants.
   const thinkingBases = new Set<string>();
   for (const m of models) {
-    const info = splitThinkingId(m.id);
-    if (info) thinkingBases.add(info.base);
+    const match = m.id.match(/^(.*):thinking(?:\S*)?$/i);
+    if (match) thinkingBases.add(match[1]);
   }
 
-  return models.map((model) => {
-    const info = splitThinkingId(model.id);
-    if (!info) {
-      // Non-thinking variant.
-      // If this base has :thinking variants, force reasoning=false
-      // because NanoGPT controls thinking via model ID, not parameters.
-      const hasThinkingVariant = thinkingBases.has(model.id);
-      return toPiModel(model, undefined, hasThinkingVariant ? false : undefined);
-    }
-
-    // This IS a :thinking variant.
-    // Map Pi levels to this variant's fixed level only.
-    // e.g. `:thinking:low` → only "low" is active, everything else hidden.
-    const piLevel = info.level;
-    const thinkingMap: NonNullable<ProviderModelConfig["thinkingLevelMap"]> = {
-      off: null,
-      minimal: null,
-      low: piLevel === "low" ? "low" : null,
-      medium: piLevel === "medium" ? "medium" : null,
-      high: piLevel === "high" ? "high" : null,
-      xhigh: piLevel === "xhigh" ? "max" : null,
-    };
-
-    return toPiModel(model, thinkingMap);
-  });
+  return models
+    // Skip :thinking variants — Pi sends reasoning_effort instead.
+    .filter((m) => !m.id.includes(":thinking"))
+    .map((model) => {
+      // If NanoGPT lists a :thinking variant for this base, the base model
+      // actually supports reasoning via reasoning_effort.
+      const supportsReasoning = Boolean(model.capabilities?.reasoning) || thinkingBases.has(model.id);
+      return toPiModel({ ...model, capabilities: { ...model.capabilities, reasoning: supportsReasoning } });
+    });
 }
 
 function providerConfig(models: ProviderModelConfig[]) {
