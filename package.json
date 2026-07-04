@@ -1,0 +1,14 @@
+{
+  "name": "pi-nanogpt",
+  "version": "0.1.0",
+  "description": "NanoGPT provider extension for Pi",
+  "keywords": ["pi-package", "nanogpt", "provider", "llm"],
+  "author": "Sokoshy",
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./extensions"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
