@@ -53,29 +53,29 @@ function price(value: number | string | undefined): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-function thinkingLevelMap(id: string): ProviderModelConfig["thinkingLevelMap"] | undefined {
-  const match = id.match(/:thinking(?::(low|medium|max|xhigh))?$/i);
+function splitThinkingId(id: string): { base: string; level: keyof NonNullable<ProviderModelConfig["thinkingLevelMap"]>; suffix: string } | undefined {
+  const match = id.match(/^(.*):thinking(?::(low|medium|max|xhigh))?$/i);
   if (!match) return undefined;
 
-  const level = (match[1]?.toLowerCase() ?? "high") === "max" ? "xhigh" : match[1]?.toLowerCase() ?? "high";
+  const suffix = match[2]?.toLowerCase();
   return {
-    off: null,
-    minimal: null,
-    low: level === "low" ? "low" : null,
-    medium: level === "medium" ? "medium" : null,
-    high: level === "high" ? "high" : null,
-    xhigh: level === "xhigh" ? "max" : null,
+    base: match[1],
+    level: suffix === "low" || suffix === "medium" ? suffix : suffix === "max" || suffix === "xhigh" ? "xhigh" : "high",
+    suffix: suffix ? `:thinking:${suffix}` : ":thinking",
   };
 }
 
-function toPiModel(model: NanoModel, thinkingBases: Set<string>): ProviderModelConfig {
-  const map = thinkingLevelMap(model.id);
-  const reasoning = Boolean(map || (model.capabilities?.reasoning && !thinkingBases.has(model.id)));
+function toPiModel(
+  model: NanoModel,
+  thinkingMap?: ProviderModelConfig["thinkingLevelMap"],
+  forceReasoning?: boolean,
+): ProviderModelConfig {
+  const reasoning = forceReasoning ?? Boolean(thinkingMap || model.capabilities?.reasoning);
   return {
     id: model.id,
     name: model.name ?? model.id,
     reasoning,
-    ...(map ? { thinkingLevelMap: map } : {}),
+    ...(thinkingMap ? { thinkingLevelMap: thinkingMap } : {}),
     input: model.capabilities?.vision ? ["text", "image"] : ["text"],
     cost: {
       input: price(model.pricing?.prompt),
@@ -88,7 +88,7 @@ function toPiModel(model: NanoModel, thinkingBases: Set<string>): ProviderModelC
     compat: {
       supportsStore: false,
       supportsDeveloperRole: false,
-      supportsReasoningEffort: false,
+      supportsReasoningEffort: Boolean(thinkingMap),
       maxTokensField: "max_tokens",
     },
   };
@@ -103,13 +103,39 @@ async function fetchNanoModels(apiKey?: string): Promise<ProviderModelConfig[]> 
 
   const body = (await res.json()) as { data?: NanoModel[] };
   const models = (body.data ?? []).filter((m) => m.id);
-  const thinkingBases = new Set(
-    models
-      .map((m) => m.id.match(/^(.*):thinking(?::(?:low|medium|max|xhigh))?$/i)?.[1])
-      .filter((id): id is string => Boolean(id)),
-  );
 
-  return models.map((model) => toPiModel(model, thinkingBases));
+  // Collect which base IDs have :thinking variants
+  const thinkingBases = new Set<string>();
+  for (const m of models) {
+    const info = splitThinkingId(m.id);
+    if (info) thinkingBases.add(info.base);
+  }
+
+  return models.map((model) => {
+    const info = splitThinkingId(model.id);
+    if (!info) {
+      // Non-thinking variant.
+      // If this base has :thinking variants, force reasoning=false
+      // because NanoGPT controls thinking via model ID, not parameters.
+      const hasThinkingVariant = thinkingBases.has(model.id);
+      return toPiModel(model, undefined, hasThinkingVariant ? false : undefined);
+    }
+
+    // This IS a :thinking variant.
+    // Map Pi levels to this variant's fixed level only.
+    // e.g. `:thinking:low` → only "low" is active, everything else hidden.
+    const piLevel = info.level;
+    const thinkingMap: NonNullable<ProviderModelConfig["thinkingLevelMap"]> = {
+      off: null,
+      minimal: null,
+      low: piLevel === "low" ? "low" : null,
+      medium: piLevel === "medium" ? "medium" : null,
+      high: piLevel === "high" ? "high" : null,
+      xhigh: piLevel === "xhigh" ? "max" : null,
+    };
+
+    return toPiModel(model, thinkingMap);
+  });
 }
 
 function providerConfig(models: ProviderModelConfig[]) {
