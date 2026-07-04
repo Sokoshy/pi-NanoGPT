@@ -10,6 +10,12 @@ It discovers text models from NanoGPT's OpenAI-compatible `/api/v1/models?detail
 pi install git:github.com/Sokoshy/pi-NanoGPT
 ```
 
+## Uninstall
+
+```bash
+pi remove git:github.com/Sokoshy/pi-NanoGPT
+```
+
 Local test from this folder:
 
 ```bash
