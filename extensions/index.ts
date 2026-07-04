@@ -53,12 +53,29 @@ function price(value: number | string | undefined): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-function toPiModel(model: NanoModel): ProviderModelConfig {
-  const reasoning = Boolean(model.capabilities?.reasoning || model.id.includes(":thinking"));
+function thinkingLevelMap(id: string): ProviderModelConfig["thinkingLevelMap"] | undefined {
+  const match = id.match(/:thinking(?::(low|medium|max|xhigh))?$/i);
+  if (!match) return undefined;
+
+  const level = (match[1]?.toLowerCase() ?? "high") === "max" ? "xhigh" : match[1]?.toLowerCase() ?? "high";
+  return {
+    off: null,
+    minimal: null,
+    low: level === "low" ? "low" : null,
+    medium: level === "medium" ? "medium" : null,
+    high: level === "high" ? "high" : null,
+    xhigh: level === "xhigh" ? "max" : null,
+  };
+}
+
+function toPiModel(model: NanoModel, thinkingBases: Set<string>): ProviderModelConfig {
+  const map = thinkingLevelMap(model.id);
+  const reasoning = Boolean(map || (model.capabilities?.reasoning && !thinkingBases.has(model.id)));
   return {
     id: model.id,
     name: model.name ?? model.id,
     reasoning,
+    ...(map ? { thinkingLevelMap: map } : {}),
     input: model.capabilities?.vision ? ["text", "image"] : ["text"],
     cost: {
       input: price(model.pricing?.prompt),
@@ -85,7 +102,14 @@ async function fetchNanoModels(apiKey?: string): Promise<ProviderModelConfig[]> 
   if (!res.ok) throw new Error(`NanoGPT models request failed: ${res.status}`);
 
   const body = (await res.json()) as { data?: NanoModel[] };
-  return (body.data ?? []).filter((m) => m.id).map(toPiModel);
+  const models = (body.data ?? []).filter((m) => m.id);
+  const thinkingBases = new Set(
+    models
+      .map((m) => m.id.match(/^(.*):thinking(?::(?:low|medium|max|xhigh))?$/i)?.[1])
+      .filter((id): id is string => Boolean(id)),
+  );
+
+  return models.map((model) => toPiModel(model, thinkingBases));
 }
 
 function providerConfig(models: ProviderModelConfig[]) {
