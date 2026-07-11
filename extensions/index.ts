@@ -1,6 +1,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
@@ -8,7 +9,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 
 const PROVIDER = "NanoGPT";
-const CACHE_PATH = join(homedir(), ".pi", "nanogpt-models.json");
+const CACHE_PATH = join(homedir(), CONFIG_DIR_NAME, "nanogpt-models.json");
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const BASE_URL = "https://nano-gpt.com/api/v1";
 const MODELS_DEV_URL = "https://models.dev/api.json";
@@ -92,7 +93,8 @@ function thinkingMapFromModelsDev(model?: ModelsDevModel): ThinkingLevelMap | un
     low: values.has("low") ? "low" : null,
     medium: values.has("medium") ? "medium" : null,
     high: values.has("high") ? "high" : null,
-    xhigh: values.has("xhigh") ? "xhigh" : values.has("max") ? "max" : null,
+    xhigh: values.has("xhigh") ? "xhigh" : null,
+    max:   values.has("max")   ? "max"   : null,
   };
 }
 
@@ -105,7 +107,7 @@ function toPiModel(model: NanoModel, devModel?: ModelsDevModel): ProviderModelCo
     ? hasEffort ? thinkingMapFromModelsDev(devModel)
     : !devModel ? {
         off: "none", minimal: "minimal", low: "low",
-        medium: "medium", high: "high", xhigh: "xhigh",
+        medium: "medium", high: "high", xhigh: "xhigh", max: "max",
       }
     : undefined
     : undefined;
