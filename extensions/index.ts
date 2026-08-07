@@ -1,7 +1,3 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
-import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
@@ -9,7 +5,6 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 
 const PROVIDER = "NanoGPT";
-const CACHE_PATH = join(homedir(), CONFIG_DIR_NAME, "nanogpt-models.json");
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const BASE_URL = "https://nano-gpt.com/api/v1";
 const MODELS_DEV_URL = "https://models.dev/api.json";
@@ -38,25 +33,22 @@ interface NanoModel {
   };
 }
 
-interface ModelCache {
-  fetchedAt: number;
-  models: ProviderModelConfig[];
-}
-
-async function readCache(): Promise<ModelCache | undefined> {
-  try {
-    const cache = JSON.parse(await readFile(CACHE_PATH, "utf8")) as ModelCache;
-    return typeof cache.fetchedAt === "number" && Array.isArray(cache.models)
-      ? cache
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-async function writeCache(models: ProviderModelConfig[]): Promise<void> {
-  await mkdir(dirname(CACHE_PATH), { recursive: true });
-  await writeFile(CACHE_PATH, JSON.stringify({ fetchedAt: Date.now(), models }, null, 2));
+/**
+ * Structural subset of the `RefreshModelsContext` passed by Pi to
+ * `refreshModels` (the full type is not part of the public export surface).
+ */
+interface RefreshContext {
+  /** Effective configured credential — stored key or resolved env var. */
+  credential?: { type: string; key?: string };
+  /** Persisted catalog snapshot captured before this refresh phase. */
+  stored?: { models: readonly ProviderModelConfig[]; checkedAt?: number };
+  /** Generation-checked publication of the catalog snapshot. */
+  publish(publication: { persist?: unknown; update?: () => void }): Promise<boolean>;
+  /** False during offline/cache-only initialization. */
+  allowNetwork: boolean;
+  /** Bypass the provider freshness check when network access is allowed. */
+  force?: boolean;
+  signal: AbortSignal;
 }
 
 function price(value: number | string | undefined): number {
@@ -64,9 +56,9 @@ function price(value: number | string | undefined): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-async function fetchModelsDev(): Promise<Map<string, ModelsDevModel>> {
+async function fetchModelsDev(signal?: AbortSignal): Promise<Map<string, ModelsDevModel>> {
   try {
-    const res = await fetch(MODELS_DEV_URL);
+    const res = await fetch(MODELS_DEV_URL, { signal });
     if (!res.ok) return new Map();
     const catalog = await res.json() as Record<string, { models?: Record<string, ModelsDevModel> }>;
     const index = new Map<string, ModelsDevModel>();
@@ -134,11 +126,11 @@ function toPiModel(model: NanoModel, devModel?: ModelsDevModel): ProviderModelCo
   };
 }
 
-async function fetchNanoModels(apiKey?: string): Promise<ProviderModelConfig[]> {
+async function fetchNanoModels(apiKey: string | undefined, signal?: AbortSignal): Promise<ProviderModelConfig[]> {
   const headers: Record<string, string> = { Accept: "application/json" };
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
 
-  const res = await fetch(`${BASE_URL}/models?detailed=true&sort=favorites`, { headers });
+  const res = await fetch(`${BASE_URL}/models?detailed=true&sort=favorites`, { headers, signal });
   if (!res.ok) throw new Error(`NanoGPT models request failed: ${res.status}`);
 
   const body = (await res.json()) as { data?: NanoModel[] };
@@ -152,7 +144,7 @@ async function fetchNanoModels(apiKey?: string): Promise<ProviderModelConfig[]> 
   }
 
   // Fetch models.dev for per-model reasoning_options.
-  const devIndex = await fetchModelsDev();
+  const devIndex = await fetchModelsDev(signal);
 
   return models
     // Skip :thinking variants — Pi sends reasoning_effort instead.
@@ -168,81 +160,64 @@ async function fetchNanoModels(apiKey?: string): Promise<ProviderModelConfig[]> 
     });
 }
 
-function providerConfig(models: ProviderModelConfig[]) {
-  return {
-    name: PROVIDER,
-    baseUrl: BASE_URL,
-    api: "openai-completions" as const,
-    authHeader: true,
-    apiKey: "$NANOGPT_API_KEY",
-    models,
-  };
-}
-
-async function registerModels(
-  pi: ExtensionAPI,
-  apiKey?: string,
-  notify?: (message: string, type: string) => void,
-): Promise<void> {
-  const models = await fetchNanoModels(apiKey);
-  if (!models.length) throw new Error("No NanoGPT models returned");
-
-  pi.registerProvider(PROVIDER, providerConfig(models));
-  await writeCache(models);
-  notify?.(`NanoGPT: ${models.length} models loaded`, "info");
-}
-
-async function loginNanoGPT(pi: ExtensionAPI, ctx: ExtensionCommandContext) {
-  const apiKey = await ctx.ui.input("Enter your NanoGPT API key:", "sk-...");
-  if (!apiKey?.trim()) return;
-
-  try {
-    ctx.modelRegistry.authStorage.set(PROVIDER, {
-      type: "api_key" as const,
-      key: apiKey.trim(),
-    });
-    await registerModels(pi, apiKey.trim(), ctx.ui.notify);
-  } catch (err) {
-    ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
+/**
+ * Dynamic model discovery for Pi 0.84+.
+ *
+ * Pi calls this during model refresh: first offline (to restore the persisted
+ * catalog), then online with the resolved credential. The extension persists
+ * the catalog via `context.publish` and returns the list, which Pi publishes
+ * synchronously — no manual cache file or re-registration needed.
+ */
+async function refreshNanoModels(ctx: RefreshContext): Promise<ProviderModelConfig[]> {
+  // Offline phase (startup, post-login sync): restore the persisted catalog.
+  if (!ctx.allowNetwork) {
+    return ctx.stored?.models?.length ? [...ctx.stored.models] : [];
   }
+
+  // Freshness check: keep the persisted list for up to 24h to avoid
+  // hammering the NanoGPT API on every startup.
+  if (!ctx.force && ctx.stored?.checkedAt && Date.now() - ctx.stored.checkedAt < CACHE_TTL_MS) {
+    return ctx.stored.models.length ? [...ctx.stored.models] : [];
+  }
+
+  const apiKey = ctx.credential?.type === "api_key" ? ctx.credential.key : undefined;
+  const models = await fetchNanoModels(apiKey, ctx.signal);
+
+  // Persist the catalog for offline/cached restores; the returned list is
+  // published in-memory by Pi. On failure the previous list is retained.
+  await ctx.publish({ persist: { models, checkedAt: Date.now() } });
+  return models;
 }
 
 export default async function (pi: ExtensionAPI) {
-  const cache = await readCache();
-  pi.registerProvider(PROVIDER, providerConfig(cache?.models ?? []));
-
-  const shouldRefresh = !cache || Date.now() - cache.fetchedAt > CACHE_TTL_MS;
-  if (shouldRefresh) {
-    try {
-      await registerModels(pi, process.env.NANOGPT_API_KEY);
-    } catch {
-      // ponytail: network/API failures keep the last cached model list.
-    }
-  }
-
-  pi.on("session_start", async (_event, ctx) => {
-    const cache = await readCache();
-    if (cache && Date.now() - cache.fetchedAt <= CACHE_TTL_MS) return;
-
-    const apiKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER);
-    try {
-      await registerModels(pi, apiKey);
-    } catch {
-      // ponytail: startup should not fail just because model discovery did.
-    }
-  });
-
-  pi.registerCommand("login-nanogpt", {
-    description: "Enter your NanoGPT API key and load models",
-    handler: async (_args: string, ctx) => loginNanoGPT(pi, ctx),
+  pi.registerProvider(PROVIDER, {
+    name: PROVIDER,
+    baseUrl: BASE_URL,
+    api: "openai-completions",
+    authHeader: true,
+    // Config reference only: the key is resolved from the environment or from
+    // the credential stored by Pi's built-in `/login NanoGPT`.
+    apiKey: "$NANOGPT_API_KEY",
+    refreshModels: refreshNanoModels,
   });
 
   pi.registerCommand("refresh-nanogpt", {
     description: "Refresh NanoGPT models from the API",
-    handler: async (_args: string, ctx) => {
-      const apiKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER);
+    handler: async (_args: string, ctx: ExtensionCommandContext) => {
       try {
-        await registerModels(pi, apiKey, ctx.ui.notify);
+        const result = await ctx.modelRegistry.refresh({
+          providers: [PROVIDER],
+          force: true,
+          signal: AbortSignal.timeout(20_000),
+        });
+        if (result.aborted) {
+          ctx.ui.notify("NanoGPT refresh timed out; using cached models", "warning");
+        } else if (result.errors.size > 0) {
+          const message = result.errors.get(PROVIDER)?.message ?? "unknown error";
+          ctx.ui.notify(`NanoGPT refresh failed: ${message}`, "error");
+        } else {
+          ctx.ui.notify("NanoGPT models refreshed", "info");
+        }
       } catch (err) {
         ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
       }
